@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>RASA Living Wall</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="./config.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;width:100vw;height:100vh;background:#030303;color:#eee;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC","PingFang TC","Microsoft JhengHei",Arial,sans-serif}
+body:before{content:"";position:fixed;inset:-20%;background:radial-gradient(circle at 18% 20%,rgba(255,255,255,.08),transparent 28%),radial-gradient(circle at 84% 74%,rgba(255,255,255,.055),transparent 34%),linear-gradient(180deg,#080808,#010101);filter:blur(22px);animation:bg 12s ease-in-out infinite alternate;pointer-events:none}
+@keyframes bg{to{transform:scale(1.05);opacity:.8}}
+.brand{position:fixed;left:42px;top:34px;display:flex;gap:24px;align-items:center;z-index:3;opacity:.78}.brand img{filter:invert(1) brightness(1.22);opacity:.82}.brand .rasa{width:160px}.brand .wenyi{width:210px}.brand:before{content:"";position:absolute;inset:-28px;background:radial-gradient(circle,rgba(255,255,255,.12),transparent 65%);filter:blur(18px);z-index:-1}.meta{position:fixed;right:42px;top:38px;color:#777;letter-spacing:.18em;font-size:12px;text-transform:uppercase;z-index:3}.field{position:fixed;inset:0}.item{position:absolute;max-width:min(560px,46vw);min-width:220px;opacity:0;filter:blur(10px);animation:float var(--dur,34s) ease-in-out forwards;will-change:transform,opacity,filter;z-index:1}.item.replay{opacity:.86}.item.new .bubble{border-color:rgba(255,255,255,.18);box-shadow:0 20px 80px rgba(0,0,0,.45),0 0 90px rgba(255,255,255,.08)}.bubble{padding:24px 28px;border:1px solid rgba(255,255,255,.11);background:rgba(12,12,12,.56);border-radius:30px;box-shadow:0 20px 80px rgba(0,0,0,.45),0 0 60px rgba(255,255,255,.045);backdrop-filter:blur(15px)}.freq{font-size:10px;letter-spacing:.22em;text-transform:uppercase;color:#888;margin-bottom:12px}.msg{font-size:clamp(24px,3.2vw,48px);line-height:1.48;letter-spacing:.05em;font-weight:300;white-space:pre-wrap}.nick{margin-top:14px;font-size:12px;color:#777;letter-spacing:.12em}.empty{position:fixed;left:50%;top:52%;transform:translate(-50%,-50%);text-align:center;color:#555;letter-spacing:.2em;line-height:2;z-index:2}.pulse{width:10px;height:10px;border-radius:50%;background:#777;margin:0 auto 22px;box-shadow:0 0 30px rgba(255,255,255,.28);animation:pulse 1.8s infinite ease-in-out}@keyframes pulse{50%{opacity:.35;transform:scale(.75)}}
+@keyframes float{0%{opacity:0;filter:blur(12px);transform:translate3d(0,56px,0) scale(.94) rotate(var(--rot))}13%{opacity:.94;filter:blur(0);transform:translate3d(var(--dx1),var(--dy1),0) scale(1) rotate(var(--rot))}76%{opacity:.94;filter:blur(0)}100%{opacity:0;filter:blur(12px);transform:translate3d(var(--dx2),var(--dy2),0) scale(1.04) rotate(var(--rot))}}
+.footer{position:fixed;left:42px;bottom:34px;color:#555;letter-spacing:.18em;font-size:11px;text-transform:uppercase;z-index:3}.count{position:fixed;right:42px;bottom:34px;color:#555;letter-spacing:.18em;font-size:11px;z-index:3}.loopStatus{position:fixed;right:42px;bottom:58px;color:#444;letter-spacing:.16em;font-size:10px;text-transform:uppercase;z-index:3}
+</style></head>
+<body>
+<div class="brand"><img class="rasa" src="./assets/rasa-logo.png"><img class="wenyi" src="./assets/wenyi-logo.png"></div>
+<div class="meta">Living Wall</div>
+<div class="field" id="field"></div>
+<div class="empty" id="empty"><div class="pulse"></div>等待新的共鳴<br>WAITING FOR RESONANCE</div>
+<div class="footer">RASA × 文義復興</div>
+<div class="loopStatus" id="loopStatus">archive loop</div>
+<div class="count" id="count">0 memories</div>
+<script>
+(function(){
+ const cfg=window.RASA_CONFIG||{};
+ const client=window.supabase.createClient(cfg.SUPABASE_URL,cfg.SUPABASE_ANON_KEY);
+ const field=document.getElementById('field');
+ const empty=document.getElementById('empty');
+ const count=document.getElementById('count');
+ const loopStatus=document.getElementById('loopStatus');
+ const params=new URLSearchParams(location.search);
+ const only=params.get('f');
+
+ const pool=[];
+ const recent=[];
+ const placed=[];
+ let activeCount=0;
+ let initialPlayed=false;
+ let loading=false;
+
+ const INITIAL_LIMIT=80;       // 開牆時抓最近 80 則
+ const INITIAL_SHOW=10;        // 開場先連續飄出 10 則
+ const LOOP_EVERY_MS=6500;     // 沒人留言時，每 6.5 秒讓舊內容回來
+ const NEW_POST_HOLD_MS=1800;  // 新留言進來時，讓輪播暫停一下避免太擠
+ const MAX_ACTIVE=9;           // 畫面上最多同時存在的卡片數
+ let pauseLoopUntil=0;
+
+ function rand(min,max){return Math.random()*(max-min)+min}
+ function esc(s){return (s||'').replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
+ function validPost(post){return post && post.message && String(post.message).trim().length>0 && (!only || Number(only)===Number(post.frequency))}
+ function postKey(post){return String(post.id || (post.created_at+'-'+post.message))}
+ function updateCount(){count.textContent=pool.length+' memories'}
+ function remember(post){
+   if(!validPost(post))return false;
+   const key=postKey(post);
+   if(pool.some(p=>postKey(p)===key))return false;
+   pool.push(post);
+   if(pool.length>120) pool.shift();
+   updateCount();
+   return true;
+ }
+ function pickSpot(){
+   const now=Date.now();
+   for(let i=placed.length-1;i>=0;i--){ if(now-placed[i].t>42000) placed.splice(i,1); }
+   for(let i=0;i<36;i++){
+     const x=rand(6,68), y=rand(15,70);
+     if(!placed.some(p=>Math.abs(p.x-x)<20 && Math.abs(p.y-y)<22)){
+       placed.push({x,y,t:now});
+       return {x,y};
+     }
+   }
+   return {x:rand(6,68),y:rand(15,70)};
+ }
+ function render(post,kind){
+   if(!validPost(post))return;
+   empty.style.display='none';
+   activeCount++;
+
+   const spot=pickSpot();
+   const el=document.createElement('div');
+   el.className='item '+(kind==='new'?'new':'replay');
+   const dur=kind==='new'?rand(34,46):rand(30,44);
+   el.style.left=spot.x+'vw';
+   el.style.top=spot.y+'vh';
+   el.style.setProperty('--dur',dur+'s');
+   el.style.setProperty('--rot',rand(-2.4,2.4)+'deg');
+   el.style.setProperty('--dx1',rand(-18,18)+'px');
+   el.style.setProperty('--dy1',rand(-24,10)+'px');
+   el.style.setProperty('--dx2',rand(-70,70)+'px');
+   el.style.setProperty('--dy2',rand(-145,-58)+'px');
+
+   el.innerHTML=`<div class="bubble"><div class="freq">RASA RESONANCE</div><div class="msg">${esc(post.message)}</div><div class="nick">${esc(post.nickname||'Anonymous')}</div></div>`;
+   field.appendChild(el);
+
+   const key=postKey(post);
+   recent.push(key);
+   if(recent.length>Math.min(18,Math.max(5,pool.length)))recent.shift();
+
+   setTimeout(()=>{el.remove(); activeCount=Math.max(0,activeCount-1);},dur*1000+900);
+ }
+ function pickFromPool(){
+   if(pool.length===0)return null;
+   if(pool.length===1)return pool[0];
+   const candidates=pool.filter(p=>!recent.includes(postKey(p)));
+   const source=candidates.length?candidates:pool;
+   return source[Math.floor(Math.random()*source.length)];
+ }
+ function loopOnce(force){
+   if(!force && Date.now()<pauseLoopUntil)return;
+   if(activeCount>=MAX_ACTIVE)return;
+   const p=pickFromPool();
+   if(p) render(p,'replay');
+ }
+ async function load(){
+   if(loading)return;
+   loading=true;
+   try{
+     let query=client.from('posts').select('*').order('created_at',{ascending:false}).limit(INITIAL_LIMIT);
+     if(only) query=query.eq('frequency',Number(only));
+     const {data,error}=await query;
+     if(error){console.error(error); return}
+     const list=(data||[]).reverse();
+     list.forEach(remember);
+     if(pool.length>0){
+       empty.style.display='none';
+       if(!initialPlayed){
+         initialPlayed=true;
+         const first=list.slice(-INITIAL_SHOW);
+         first.forEach((p,i)=>setTimeout(()=>render(p,'replay'),i*1200));
+         setTimeout(()=>loopOnce(true), first.length*1200+1200);
+       }
+     }
+   }finally{loading=false;}
+ }
+ function subscribe(){
+   client.channel('rasa-posts-text-loop')
+     .on('postgres_changes',{event:'INSERT',schema:'public',table:'posts'},payload=>{
+       if(remember(payload.new)){
+         pauseLoopUntil=Date.now()+NEW_POST_HOLD_MS;
+         render(payload.new,'new');
+       }
+     })
+     .subscribe(status=>{
+       loopStatus.textContent=status==='SUBSCRIBED'?'archive loop / live':'reconnecting';
+       if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+         setTimeout(subscribe,3000);
+       }
+     });
+ }
+
+ load();
+ subscribe();
+ setInterval(()=>loopOnce(false),LOOP_EVERY_MS);
+ setInterval(load,60000);
+ document.addEventListener('visibilitychange',()=>{ if(!document.hidden) load(); });
+ document.addEventListener('click',()=>{ if(document.fullscreenEnabled&&!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{}); },{once:true});
+})();
+</script></body></html>
